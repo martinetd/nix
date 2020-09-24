@@ -7,6 +7,11 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
+#if __linux__
+  /* for fstatfs and BTRFS magic */
+  #include <sys/vfs.h>
+  #include <linux/magic.h>
+#endif
 #include <unistd.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -14,8 +19,50 @@
 #include "archive.hh"
 #include "util.hh"
 #include "config.hh"
+#include "args.hh"
+#include "abstract-setting-to-json.hh"
 
 namespace nix {
+
+enum class autoOption { Ofalse, Otrue, Oauto };
+
+template<> void BaseSetting<autoOption>::set(const std::string & str)
+{
+    if (str == "true") value = autoOption::Otrue;
+    else if (str == "auto") value = autoOption::Oauto;
+    else if (str == "false") value = autoOption::Ofalse;
+    else throw UsageError("option '%s' has invalid value '%s'", name, str);
+}
+
+template<> std::string BaseSetting<autoOption>::to_string() const
+{
+    if (value == autoOption::Otrue) return "true";
+    else if (value == autoOption::Oauto) return "auto";
+    else if (value == autoOption::Ofalse) return "false";
+    else abort();
+}
+
+template<> void BaseSetting<autoOption>::convertToArg(Args & args, const std::string & category)
+{
+    args.addFlag({
+        .longName = name,
+        .description = description,
+        .category = category,
+        .handler = {[=](std::vector<std::string> ss) { override(autoOption::Otrue); }}
+    });
+    args.addFlag({
+        .longName = "no-" + name,
+        .description = description,
+        .category = category,
+        .handler = {[=](std::vector<std::string> ss) { override(autoOption::Ofalse); }}
+    });
+    args.addFlag({
+        .longName = "auto-" + name,
+        .description = description,
+        .category = category,
+        .handler = {[=](std::vector<std::string> ss) { override(autoOption::Oauto); }}
+    });
+}
 
 struct ArchiveSettings : Config
 {
@@ -27,7 +74,8 @@ struct ArchiveSettings : Config
         #endif
         "use-case-hack",
         "Whether to enable a Darwin-specific hack for dealing with file name collisions."};
-    Setting<bool> preallocateContents{this, true, "preallocate-contents",
+    Setting<autoOption> preallocateContents{this, autoOption::Oauto,
+        "preallocate-contents",
         "Whether to preallocate files when writing objects with known size."};
 };
 
@@ -325,7 +373,23 @@ struct RestoreSink : ParseSink
 
     void preallocateContents(uint64_t len)
     {
-        if (!archiveSettings.preallocateContents)
+#if __linux__
+        if (archiveSettings.preallocateContents == autoOption::Oauto) {
+            struct statfs statfsbuf;
+            if (fstatfs(fd.get(), &statfsbuf) < 0) {
+                /* cannot statfs ?! assume fallocate won't work either... */
+                archiveSettings.preallocateContents = autoOption::Ofalse;
+#ifdef BTRFS_SUPER_MAGIC
+            } else if (statfsbuf.f_type == BTRFS_SUPER_MAGIC) {
+                archiveSettings.preallocateContents = autoOption::Ofalse;
+#endif
+            } else {
+                archiveSettings.preallocateContents = autoOption::Otrue;
+            }
+        }
+#endif
+
+        if (archiveSettings.preallocateContents == autoOption::Ofalse)
             return;
 
 #if HAVE_POSIX_FALLOCATE
